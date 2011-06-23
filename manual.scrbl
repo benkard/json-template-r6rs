@@ -3,9 +3,6 @@
 @(require racket/sandbox)
 @(require (for-label r6rs))
 @;@(require (for-label "json-template.s6l"))
-@(require "json-template.s6l")
-
-@;@defmodule/this-package[json-template]
 
 @(define r6rs-evaluator
    (call-with-trusted-sandbox-configuration
