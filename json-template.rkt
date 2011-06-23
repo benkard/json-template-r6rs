@@ -12,25 +12,10 @@
  (import (rnrs base) (rnrs programs) (rnrs unicode) (rnrs lists) (rnrs control)
          (rnrs records syntactic) (rnrs records procedural) (rnrs records inspection)
          (rnrs exceptions) (rnrs conditions) (rnrs io simple) (rnrs io ports) (rnrs hashtables)
-         (rnrs r5rs) (srfi :39) (srfi :28)
-         ;; Racket-specific:
-         (only (racket)
-               regexp-quote regexp-replace regexp regexp-split regexp-match)
-         (only (racket mpair)
-               list->mlist)
-         
-         )
- 
- ;; Racket-specific:
- (define pregexp-quote regexp-quote)
- (define pregexp-split (lambda args (list->mlist (apply regexp-split args))))
- (define pregexp regexp)
- (define pregexp-replace regexp-replace)
- (define pregexp-match
-   (lambda args
-     (let ([m (apply regexp-match args)])
-       (and m
-            (list->mlist m)))))
+         (rnrs r5rs)
+         (srfi :39) (srfi :28)
+         (pregexp))
+
  
 (define meta-left (make-parameter "{"))
 (define meta-right (make-parameter "}"))
@@ -66,7 +51,7 @@
 (define (template-string->chunks input meta-left meta-right)
   (let* ([meta-left-re   (pregexp-quote meta-left)]
          [meta-right-re  (pregexp-quote meta-right)]
-         [re (regexp
+         [re (pregexp
               (string-append "(" meta-left-re ")|(" meta-right-re ")"))])
     (pregexp-split re input)))
 
@@ -289,7 +274,7 @@
 (define (make-escaper replacements)
   (let* ([escapees  (map car replacements)]
          [escapings (map cdr replacements)]
-         [re        (regexp
+         [re        (pregexp
                      (string-append "^(.*?)"
                                     "(?:("
                                     (fold-left (λ (acc x)
@@ -303,13 +288,14 @@
     (λ (thing)
         (call-with-string-output-port
          (λ (out)
-           (let ([in (open-string-input-port (if (string? thing)
-                                                 thing
-                                                 (format "~a" thing)))])
-             (let loop ()
-               (if (eof-object? (peek-char in))
+           (let ([input (if (string? thing)
+                            thing
+                            (format "~a" thing))])
+             (let loop ([position 0])
+               (if (>= position (string-length input))
                    (values)
-                   (let* ([m               (pregexp-match re in)]
+                   (let* ([m               (pregexp-match re input position)]
+                          [positions       (pregexp-match-positions re input position)]
                           [raw-text        (and m (cadr m))]
                           [escapee-matches (and m (cddr m))])
                      (when raw-text
@@ -319,7 +305,7 @@
                                    (display y out)))
                                escapee-matches
                                escapings)
-                     (loop))))))))))
+                     (loop (cdar positions)))))))))))
 
 
 (define (escape-for-uri thing)
