@@ -1,28 +1,86 @@
+#!r6rs
 ;;; -*- mode: scheme; coding: utf-8 -*-
 ;;; Copyright 2011, Matthias Andreas Benkard.
-#lang racket
 
-(provide read-template
-         formatters)
+(library (json-template)
+ (export make-template
+         formatters
+         meta-left
+         meta-right
+         default-formatter
+         format-char)
+ (import (rnrs base) (rnrs programs) (rnrs unicode) (rnrs lists) (rnrs control)
+         (rnrs records syntactic) (rnrs records procedural) (rnrs records inspection)
+         (rnrs exceptions) (rnrs conditions) (rnrs io simple) (rnrs io ports) (rnrs hashtables)
+         (rnrs r5rs) (srfi :39) (srfi :28)
+         ;; Racket-specific:
+         (only (racket)
+               regexp-quote regexp-replace regexp regexp-split regexp-match)
+         (only (racket mpair)
+               list->mlist)
+         
+         )
+ 
+ ;; Racket-specific:
+ (define pregexp-quote regexp-quote)
+ (define pregexp-split (lambda args (list->mlist (apply regexp-split args))))
+ (define pregexp regexp)
+ (define pregexp-replace regexp-replace)
+ (define pregexp-match
+   (lambda args
+     (let ([m (apply regexp-match args)])
+       (and m
+            (list->mlist m)))))
+ 
+(define meta-left (make-parameter "{"))
+(define meta-right (make-parameter "}"))
+(define default-formatter (make-parameter "raw"))
+(define format-char (make-parameter "|"))
+
+(define-syntax λ
+  (syntax-rules ()
+    [(_ forms ...)
+     (lambda forms ...)]))
+
+(define (dict? x)
+  (or (list? x)
+      (hashtable? x)))
+
+(define (dict-ref dict key default)
+  (let* ([default-default (cons #f #f)]
+         [result
+          (cond
+            [(list? dict)
+             (let ([result-cons (assoc key dict)])
+               (if result-cons
+                   (cdr result-cons)
+                   default-default))]
+            [(hashtable? dict)
+             (hashtable-ref dict key default-default)])])
+    (if (eq? result default-default)
+        (if (procedure? default)
+            (default)
+            default)
+        result)))
 
 (define (template-string->chunks input meta-left meta-right)
-  (let* ([meta-left-re   (regexp-quote meta-left)]
-         [meta-right-re  (regexp-quote meta-right)]
+  (let* ([meta-left-re   (pregexp-quote meta-left)]
+         [meta-right-re  (pregexp-quote meta-right)]
          [re (regexp
               (string-append "(" meta-left-re ")|(" meta-right-re ")"))])
-    (regexp-split re input)))
+    (pregexp-split re input)))
 
 (define (flip-flop-map f1 f2 lst)
   "Like map, but alternate between f1 and f2 as the function to apply."
-  (define (flip items)
-    (match items
-      ['()          '()]
-      [(list* x xs) (cons (f1 x) (flop xs))]))
-  (define (flop items)
-    (match items
-      ['()          '()]
-      [(list* x xs) (cons (f2 x) (flip xs))]))
-  (flip lst))
+  (letrec ((flip (λ (items)
+                   (cond
+                     [(null? items)'()]
+                     [else         (cons (f1 (car items)) (flop (cdr items)))])))
+           (flop (λ (items)
+                   (cond
+                     [(null? items)'()]
+                     [else         (cons (f2 (car items)) (flip (cdr items)))]))))
+    (flip lst)))
 
 (define (classify-chunks chunks format-char)
   (flip-flop-map (λ (x) x)
@@ -30,51 +88,51 @@
                  chunks))
 
 (define (parse-directive directive format-char)
-  (match directive
-    [(regexp #rx"^#")
+  (cond
+    [(pregexp-match "^#" directive)
      #f]
-    [(regexp #px"^\\.section\\s+(.*)$" (list _ x))
-     (list 'section x)]
-    [(regexp #px"^\\.repeated\\s+section\\s+(.*)$" (list _ x))
-     (list 'repeated-section x)]
-    [#".end"
+    [(pregexp-match "^\\.section[ \t]+(.*)$" directive)
+     => (λ (x) (list 'section (cadr x)))]
+    [(pregexp-match "^\\.repeated[ \t]+section[ \t]+(.*)$" directive)
+     => (λ (x) (list 'repeated-section (cadr x)))]
+    [(string=? ".end" directive)
      (list 'end)]
-    [#".or"
+    [(string=? ".or" directive)
      (list 'or)]
-    [(regexp #px"^\\.alternates\\s+with$")
+    [(pregexp-match "^\\.alternates\\s+with$" directive)
      (list 'alternates-with)]
-    [_
-     (list* 'substitute (regexp-split (regexp-quote format-char)
-                                      directive))]))
+    [else
+     (cons 'substitute (pregexp-split (pregexp-quote format-char)
+                                            directive))]))
   
 (define (remove-spurious-newlines-from-token-groups groups)
   (let ([last-was-directive? #f])
-    (for/list ([group groups])
-      (if last-was-directive?
-          (begin
-            (set! last-was-directive? (pair? group))
-            (if (or (string? group) (bytes? group))
-                (regexp-replace #rx"^\n" group "")
-                group))
-          (begin
-            (set! last-was-directive? (pair? group))
-            group)))))
+    (map
+      (λ (group)
+        (if last-was-directive?
+            (begin
+              (set! last-was-directive? (pair? group))
+              (if (string? group)
+                  (pregexp-replace "^\n" group "")
+                  group))
+            (begin
+              (set! last-was-directive? (pair? group))
+              group)))
+      groups)))
 
-(struct section
-  (name
-   body
-   alternative)
-  #:transparent)
+(define-record-type section
+  (fields (immutable name)
+          (immutable body)
+          (immutable alternative)))
 
-(struct repeated-section section
-  (alternates-with)
-  #:transparent)
+(define-record-type repeated-section
+  (parent section)
+  (fields (immutable alternates-with)))
 
-(struct substitution
-  (name
-   formatter
-   arguments)
-  #:transparent)
+(define-record-type substitution
+  (fields (immutable name)
+          (immutable formatter)
+          (immutable arguments)))
 
 (define (parse-structure parsed-groups)
   (let loop ([parsed-groups parsed-groups]
@@ -85,23 +143,27 @@
         (values (reverse clauses)
                 (and (pair? parsed-groups) (caar parsed-groups))
                 (if (pair? parsed-groups) (cdr parsed-groups) '()))
-        (match (car parsed-groups)
-          [(list 'section x)
-           (let-values ([(stuff reason rest)
-                         (parse-structure (cdr parsed-groups))])
-             (case reason
-               [(or)
-                (let-values ([(stuff2 _ rest2)
-                              (parse-structure rest)])
-                  (loop rest2 (cons (section x stuff stuff2) clauses)))]
-               [(end)
-                (loop rest (cons (section x stuff #f) clauses))]))]
-          [(list 'repeated-section x)
+        (let ([grp (car parsed-groups)])
+          (cond
+            [(string? grp)
+             (loop (cdr parsed-groups)
+                   (cons grp clauses))]
+            [(eq? (car grp) 'section)
+             (let-values ([(stuff reason rest)
+                           (parse-structure (cdr parsed-groups))])
+               (case reason
+                 [(or)
+                  (let-values ([(stuff2 _ rest2)
+                                (parse-structure rest)])
+                    (loop rest2 (cons (make-section (cadr grp) stuff stuff2) clauses)))]
+                 [(end)
+                  (loop rest (cons (make-section (cadr grp) stuff #f) clauses))]))]
+          [(eq? (car grp) 'repeated-section)
            (let inner-loop ([subsections '()]
                             [rest (cdr parsed-groups)])
              (let-values ([(stuff reason new-rest)
                            (parse-structure rest)])
-               (when (false? reason)
+               (when (not reason)
                  (error "Premature end of file."))
                (if (eq? reason 'end)
                    (let inner-inner-loop
@@ -110,10 +172,10 @@
                         [alternates-with #f])
                      (if (null? (cdr subsections))
                          (loop new-rest
-                               (cons (repeated-section x
-                                                       (cdar subsections)
-                                                       alternative
-                                                       alternates-with)
+                               (cons (make-repeated-section (cadr grp)
+                                                            (cdar subsections)
+                                                            alternative
+                                                            alternates-with)
                                      clauses))
                          (case (caadr subsections)
                            [(alternates-with)
@@ -127,42 +189,31 @@
                            [else
                             (error "Oh no, I don't know what I'm doing here!  Subsections:" subsections)])))
                    (inner-loop (cons (cons reason stuff) subsections) new-rest))))]
-          [(list 'substitute x)
+          [(eq? (car grp) 'substitute)
            (loop (cdr parsed-groups)
-                 (cons (substitution x #f '()) clauses))]
-          [(list 'substitute x y arg ...)
-           (loop (cdr parsed-groups)
-                 (cons (substitution x y arg) clauses))]
-          [x
-           (loop (cdr parsed-groups)
-                 (cons x clauses))]))))
+                 (if (null? (cddr grp))
+                     (cons (make-substitution (cadr grp) #f '()) clauses)
+                     (cons (make-substitution (cadr grp) (caddr grp) (cdddr grp)) clauses)))])))))
 
 (define (parse-structure* x)
   (let-values ([(stuff reason rest) (parse-structure x)])
     stuff))
 
-(struct template (expander)
-  #:property prop:procedure (struct-field-index expander))
-
-(define (read-template #:meta-left         [meta-left "{"]
-                       #:meta-right        [meta-right "}"]
-                       #:default-formatter [default-formatter "raw"]
-                       #:format-char       [format-char "|"])
+(define (make-template template-string)
   (let ([template-data
          (parse-structure*
           (remove-spurious-newlines-from-token-groups
-           (classify-chunks (template-string->chunks (current-input-port)
-                                                     meta-left meta-right)
-                            format-char)))])
-    (template
-     (λ (context)
-       (expand-template template-data (list context) default-formatter)))))
+           (classify-chunks (template-string->chunks template-string
+                                                     (meta-left) (meta-right))
+                            (format-char))))])
+    (let ([default-formatter (default-formatter)])
+      (λ (context)
+        (expand-template template-data (list context) default-formatter)))))
 
-(define (name->path bytename)
-  (let ([name (bytes->string/utf-8 bytename)])
-    (if (string=? name "@")
-        '()
-        (regexp-split #rx"\\." name))))
+(define (name->path name)
+  (if (string=? name "@")
+      '()
+      (pregexp-split "\\." name)))
 
 (define (resolve-path stack path)
   (if (null? stack)
@@ -174,7 +225,7 @@
             (resolve-path (cdr stack) path)))))
 
 (define (resolve-path-in-object context path)
-  (let ([nothing (gensym)])
+  (let ([nothing (cons #f #f)])
     (cond [(null? path)
            (values context #t)]
           [(dict? context)
@@ -191,50 +242,49 @@
            (values #f #f)])))
 
 (define (find-formatter name)
-  (cdr (assoc (if (string? name)
-                  name
-                  (bytes->string/utf-8 name))
-              (formatters))))
+  (cdr (assoc name (formatters))))
 
 (define (expand-template template stack default-formatter)
-  (for ([thing template])
-    (match thing
-      [(repeated-section name body alternative alternates-with)
-       (let ([context (resolve-path stack (name->path name))])
-         (if (or (false? context)
-                 (null? (sequence->list context)))
-             (when alternative
-               (expand-template alternative
+  (for-each
+   (λ (thing)
+    (cond
+      [(repeated-section? thing)
+       (let ([context (resolve-path stack (name->path (section-name thing)))])
+         (if (or (not context)
+                 (null? context))
+             (when (section-alternative thing)
+               (expand-template (section-alternative thing)
                                 (cons context stack)
                                 default-formatter))
              (let ([first-iteration? #t])
-               (for ([value context])
-                 (when alternates-with
+               (for-each
+                (λ (value)
+                 (when (repeated-section-alternates-with thing)
                    (if first-iteration?
                        (set! first-iteration? #f)
-                       (expand-template alternates-with
+                       (expand-template (repeated-section-alternates-with thing)
                                         stack
                                         default-formatter)))
-                 (expand-template body
+                 (expand-template (section-body thing)
                                   (cons value stack)
-                                  default-formatter)))))]
-      [(section name body alternative)
-       (let ([context (resolve-path stack (name->path name))])
+                                  default-formatter))
+                context))))]
+      [(section? thing)
+       (let ([context (resolve-path stack (name->path (section-name thing)))])
          (if context
-             (expand-template body
+             (expand-template (section-body thing)
                               (cons context stack)
                               default-formatter)
-             (when alternative
-               (expand-template alternative
+             (when (section-alternative thing)
+               (expand-template (section-alternative thing)
                                 (cons context stack)
                                 default-formatter))))]
-      [(substitution name formatter args)
-       (display ((find-formatter (or formatter default-formatter))
-                 (resolve-path stack (name->path name))))]
-      [_
-       (display thing)])))
-
-
+      [(substitution? thing)
+       (display ((find-formatter (or (substitution-formatter thing) default-formatter))
+                 (resolve-path stack (name->path (substitution-name thing)))))]
+      [else
+       (display thing)]))
+   template))
 
 (define (make-escaper replacements)
   (let* ([escapees  (map car replacements)]
@@ -242,48 +292,48 @@
          [re        (regexp
                      (string-append "^(.*?)"
                                     "(?:("
-                                    (foldl (λ (x acc)
-                                             (string-append acc
-                                                            ")|("
-                                                            (regexp-quote (string x))))
-                                           (regexp-quote (string (car escapees)))
-                                           (cdr escapees))
+                                    (fold-left (λ (acc x)
+                                                 (string-append acc
+                                                                ")|("
+                                                                (pregexp-quote (string x))))
+                                               (pregexp-quote (string (car escapees)))
+                                               (cdr escapees))
                                     "))"
                                     "|$"))])
     (λ (thing)
-        (with-output-to-string
-         (λ ()
-           (with-input-from-string
-            (if (string? thing)
-                thing
-                (format "~a" thing))
-            (λ ()
-              (let loop ()
-                (unless (eof-object? (peek-byte))
-                  (match-let ([(list* _ raw-text escapee-matches)
-                               (regexp-match re (current-input-port))])
-                    (when raw-text
-                      (display raw-text))
-                    (for ([x escapee-matches]
-                          [y escapings])
-                      (when x
-                        (display y)))
-                    (loop)))))))))))
+        (call-with-string-output-port
+         (λ (out)
+           (let ([in (open-string-input-port (if (string? thing)
+                                                 thing
+                                                 (format "~a" thing)))])
+             (let loop ()
+               (if (eof-object? (peek-char in))
+                   (values)
+                   (let* ([m               (pregexp-match re in)]
+                          [raw-text        (and m (cadr m))]
+                          [escapee-matches (and m (cddr m))])
+                     (when raw-text
+                       (display raw-text out))
+                     (for-each (λ (x y)
+                                 (when x
+                                   (display y out)))
+                               escapee-matches
+                               escapings)
+                     (loop))))))))))
 
 
 (define (escape-for-uri thing)
-  (with-output-to-string
-    (λ ()
-      (for ([char (in-string (if (string? thing)
-                                 thing
-                                 (format "~a" thing)))])
+  (call-with-string-output-port
+    (λ (out)
+      (for-each
+       (λ (char)
         (let ((cnum (char->integer char)))
           (if (or (<= (char->integer #\A) cnum (char->integer #\Z))
                   (<= (char->integer #\a) cnum (char->integer #\z))
                   (<= (char->integer #\0) cnum (char->integer #\9))
                   (member char
                           '(#\$ #\- #\_ #\. #\+ #\! #\* #\( #\) #\')))
-              (display char)
+              (display char out)
               ;; FIXME: This assumes that (< cnum 256).
               ;; Maybe we should interpret the data as a byte string
               ;; rather than as a string.  W3C says we ought to use
@@ -292,8 +342,11 @@
               ;;
               ;;  http://www.w3.org/International/O-URL-code.html
               (if (< cnum 16)
-                  (printf "%0~x" cnum)
-                  (printf "%~x"  cnum))))))))
+                  (display (format "%0~x" cnum) out)
+                  (display (format "%~x"  cnum) out)))))
+        (if (string? thing)
+            thing
+            (format "~a" thing))))))
 
 
 (define formatters
@@ -311,8 +364,7 @@
 
 
 #;
-(let ([template (with-input-from-string
-                 #<<EOF
+(let ([template (make-template "
 <h1>{title|html}</h1>
 {.section people}
 <ul>
@@ -323,10 +375,10 @@
 {.or}
 <p>No one's registered.</p>
 {.end}
-EOF
-                  (λ () (read-template)))])
+")])
   (template '((title . "<Registered People>")
               (people .
                       (((name . "Nathalie") (age . 24))
                        ((name . "Heinrich") (age . 28))
                        ((name . "Hans")     (age . 25)))))))
+)
