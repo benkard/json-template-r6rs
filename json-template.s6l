@@ -256,7 +256,7 @@
                 context))))]
       [(section? thing)
        (let ([context (resolve-path stack (name->path (section-name thing)))])
-         (if context
+         (if (and context (not (null? context)))
              (expand-template (section-body thing)
                               (cons context stack)
                               default-formatter)
